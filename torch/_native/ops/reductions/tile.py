@@ -282,14 +282,8 @@ def fold_uniform_tree(
     for load in cutlass.range_constexpr(nloads):
         r = tidx + Int32(const_expr(load * threads_per_block))
         off = obase + _decode_offset(r, None, rstrides, 1)
-        carry = trait.leaf(trait.acc(mX[off]), r)
-        width = 1
-        merges = _trailing_zeros(load + 1)
-        # Not _streaming_push: combine_equal takes each level's width.
-        for _ in cutlass.range_constexpr(merges):
-            carry = trait.combine_equal(tree.pop(), carry, const_expr(width))
-            width *= 2
-        tree.append(carry)
+        leaf = trait.leaf(trait.acc(mX[off]), r)
+        _equal_count_push(tree, leaf, load, trait.combine_equal)
     acc = _linear_reduce(tree, trait.combine)
     if const_expr(tail):
         r = Int32(const_expr(nloads * threads_per_block)) + tidx
@@ -382,6 +376,16 @@ def _streaming_push(tree, val, load: int, max_depth: int, op) -> None:
     carry = val
     for _ in range(min(_trailing_zeros(load + 1), max_depth)):
         carry = op(tree.pop(), carry)
+    tree.append(carry)
+
+
+def _equal_count_push(tree, val, load: int, combine_equal_fn) -> None:
+    # Like _streaming_push, uncapped, passing each level's per-side count.
+    carry = val
+    width = 1
+    for _ in range(_trailing_zeros(load + 1)):
+        carry = combine_equal_fn(tree.pop(), carry, width)
+        width *= 2
     tree.append(carry)
 
 
@@ -717,6 +721,78 @@ def fold_cols_rolled(
     return accs
 
 
+def _col_group_issue(trait, axis, combine, vec) -> str | None:
+    if axis != "col":
+        return f"the col axis, got {axis=}"
+    if combine:
+        return "a fold of inputs, not partials"
+    if vec != 1:
+        return f"vec=1, got {vec=}"
+    if not getattr(trait, "has_combine_equal", False):
+        return f"a trait with has_combine_equal, got {type(trait).__name__}"
+    return None
+
+
+@cute.jit
+def _fold_welford_equal_group(
+    leaf_fn,
+    acc_dt,
+    combine_equal_fn,
+    mX,
+    col,
+    row0,
+    idx0,
+    group: cutlass.Constexpr,
+):
+    if const_expr(group <= 0 or group & (group - 1)):
+        raise AssertionError(f"col_group must be a positive power of two, got {group}")
+    tree = []
+    for i in cutlass.range_constexpr(group):
+        row = mX[Int64(row0 + Int32(i)), None]
+        leaf = leaf_fn(acc_dt(row[col]), idx0 + Int32(i))
+        _equal_count_push(tree, leaf, i, combine_equal_fn)
+    return tree[0]
+
+
+@cute.jit
+def fold_col_welford_grouped(
+    trait,
+    mX,
+    col,
+    storage_row0,
+    index_row0,
+    nrows,
+    group: cutlass.Constexpr,
+):
+    """Fold the leading nrows % group rows online, then the rest as equal-count Welford
+    trees of `group` rows."""
+    reduce_fn, acc_dt = trait.reduce, trait.acc
+    leaf_fn = trait.leaf
+    combine_fn = trait.combine
+    combine_equal_fn = trait.combine_equal
+    acc = trait.init()
+    tail = nrows % Int32(group)
+    for r in cutlass.range(tail):
+        row = mX[Int64(storage_row0 + Int32(r)), None]
+        acc = reduce_fn(acc, acc_dt(row[col]), index_row0 + Int32(r), True)
+    ngroups = (nrows - tail) // Int32(group)
+    for g in cutlass.range(ngroups):
+        row0 = storage_row0 + tail + g * Int32(group)
+        idx0 = index_row0 + tail + g * Int32(group)
+        root = _fold_welford_equal_group(
+            leaf_fn,
+            acc_dt,
+            combine_equal_fn,
+            mX,
+            col,
+            row0,
+            idx0,
+            const_expr(group),
+        )
+        acc = combine_fn(acc, root)
+    return (acc,)
+
+
 class TileReduce:
     """Reduction kernel parameterized by reduced axis.
 
@@ -760,6 +836,9 @@ class TileReduce:
         # loads * T and (loads + 1) * T with a tail, exactly loads * T without one.
         # ReduceBlock keeps the two consistent.
         uniform_tree_count: int | None = None,
+        # Rows per equal-count Welford tree in scalar column folds, after each block's
+        # leading cnt % col_group rows fold online; 1 disables it.
+        col_group: int = 1,
     ) -> None:
         if axis not in ("row", "col", "general"):
             raise ValueError(f"axis must be 'row', 'col' or 'general', got {axis!r}")
@@ -780,6 +859,15 @@ class TileReduce:
             )
             if issue is not None:
                 raise ValueError(f"the uniform Welford tree needs {issue}")
+        if axis == "col" and vec is None:
+            # Column vec cannot be inferred from load width.
+            raise ValueError("the col axis needs an explicit vec")
+        if col_group not in (1, 4, 8, 16):
+            raise ValueError(f"col_group must be 1, 4, 8 or 16, got {col_group}")
+        if col_group > 1:
+            issue = _col_group_issue(trait, axis, combine, vec)
+            if issue is not None:
+                raise ValueError(f"column groups need {issue}")
         itemsize = dtype.width // 8 if dtype is not None else 0
         ragged_vec = None
         if ragged_vector:
@@ -849,6 +937,7 @@ class TileReduce:
         tree_count = uniform_tree_count or 0
         self.uniform_tree_loads, tail = divmod(tree_count, threads_per_block)
         self.uniform_tree_tail = bool(tail)
+        self.col_group = col_group
         self.use_tma = use_tma
         self.combine = combine
         self.batched_col = batched_col
@@ -885,9 +974,6 @@ class TileReduce:
         elif axis == "general":
             # Arbitrary strides offer no vector width.
             self.vec = 1
-        elif vec is None:
-            # Column vec cannot be inferred from load width.
-            raise ValueError("the col axis needs an explicit vec")
         else:
             self.vec = vec
         # Columns keep vec slots; merged row and general axes keep one.
@@ -921,7 +1007,8 @@ class TileReduce:
             self.threads_per_block,
             self.nouts,
             self.final,
-            self.unroll,
+            # The grouped column fold ignores unroll, so its plans share a kernel.
+            1 if self.col_group > 1 else self.unroll,
             self.use_tma,
             self.combine,
             self.batched_col,
@@ -940,6 +1027,7 @@ class TileReduce:
             self.ragged_vector,
             self.uniform_tree_loads,
             self.uniform_tree_tail,
+            self.col_group,
             self.order,
             # Fixed DAGs key on N, requiring one kernel per shape instead of per vec class.
             self.itree.sig if self.itree is not None else None,
@@ -1818,16 +1906,27 @@ class TileReduce:
             else:
                 col = unit
                 storage_row0 = index_row0
-            accs = fold_cols_rolled(
-                trait,
-                mIns[0],
-                col,
-                storage_row0,
-                index_row0,
-                cnt,
-                const_expr(self.vec),
-                const_expr(self.unroll),
-            )
+            if const_expr(self.col_group > 1):
+                accs = fold_col_welford_grouped(
+                    trait,
+                    mIns[0],
+                    col,
+                    storage_row0,
+                    index_row0,
+                    cnt,
+                    const_expr(self.col_group),
+                )
+            else:
+                accs = fold_cols_rolled(
+                    trait,
+                    mIns[0],
+                    col,
+                    storage_row0,
+                    index_row0,
+                    cnt,
+                    const_expr(self.vec),
+                    const_expr(self.unroll),
+                )
         elif const_expr(self.use_tma):
             accs = (self._fold_tma(mIns[0], tma_atom, bx, tx),)
         elif const_expr(self.ragged_vector):

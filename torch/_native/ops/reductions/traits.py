@@ -1,6 +1,7 @@
 # Reusable CuteDSL reduction traits and cross-thread helpers. leaf creates a one-element
 # accumulator, combine merges accumulators, and reduce performs a serial update. Tree folds
-# use leaf/combine, so leaf must include every element transform. Other names mirror
+# use leaf/combine, so leaf must include every element transform. has_combine_equal opts a
+# trait into combine_equal, a closed-form merge of equal-count states. Other names mirror
 # SharedReduceOps.h. Accumulator dtypes provide their identities. Scalar conditionals lower
 # only inside cute.jit methods; cute.arch.fmax suppresses NaNs, so traits handle them.
 
@@ -163,7 +164,20 @@ def _welford_denom(acc_dtype, nf, correction):
 class WelfordOps:
     # acc = (mean, m2, nf). `reduce` is the ONLINE Welford update and `combine` the PARALLEL Chan
     # merge -- deliberately different formulas. project divides m2 by the clamped dof.
+    # has_combine_equal enables combine_equal's closed-form equal-count merges. They assume
+    # these leaf and combine methods, so a subclass that replaces either must opt back in;
+    # its subclasses inherit that choice.
     nfields = 3
+    has_combine_equal = True
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        for c in cls.__mro__[: cls.__mro__.index(WelfordOps)]:
+            if "has_combine_equal" in vars(c):
+                break
+            if "leaf" in vars(c) or "combine" in vars(c):
+                cls.has_combine_equal = False
+                break
 
     def __init__(self, correction=1, take_sqrt=False, return_mean=False, acc=Float32):
         self.correction = float(correction)
@@ -208,6 +222,19 @@ class WelfordOps:
             mean = ma + delta * nb_over_n
             m2 = m2a + m2b + delta * delta * na * nb_over_n
         return (mean, m2, nn)
+
+    @cute.jit
+    def combine_equal(self, a, b, count: cutlass.Constexpr):
+        """Combine two nonempty states that each hold `count` values.
+
+        a's and b's count fields are not read.
+        """
+        ma, m2a, _ = a
+        mb, m2b, _ = b
+        delta = mb - ma
+        mean = ma + delta * self.acc(0.5)
+        m2 = m2a + m2b + delta * delta * self.acc(count * 0.5)
+        return (mean, m2, self.acc(count * 2))
 
     @cute.jit
     def shfl_down(self, acc, offset):

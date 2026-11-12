@@ -3573,8 +3573,10 @@ class GuardBuilder(GuardBuilderBase):
         value = self.get(guard)
         length = _sequence_length(value)
 
-        if not isinstance(value, dict):
-            # C++ DICT_LENGTH checks for type
+        if not isinstance(value, dict) and not istype(
+            guard.originating_source, TypeMROSource
+        ):
+            # DICT_LENGTH checks its type; TypeMROSource reads the always-tuple tp_mro.
             self.TYPE_MATCH(guard)
 
         code = []
